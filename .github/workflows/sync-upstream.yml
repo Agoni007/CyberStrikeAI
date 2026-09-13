@@ -1,0 +1,147 @@
+name: Sync upstream (branches / tags / releases)
+
+# 将上游 AIPentest/CyberStrikeAI 的 分支 + Tags + Releases 自动镜像到本 fork。
+#
+# 重要前提：定时任务只从默认分支运行，所以本文件必须待在 main 上，
+# 这会让 main 相对上游产生自己的提交（分叉），同步逻辑因此用 merge 而非 fast-forward。
+#
+# 首次使用请到仓库 Actions 页面手动 Enable 本工作流：
+#   公开仓库被 fork 后，scheduled workflow 默认处于 disabled 状态。
+#
+on:
+  schedule:
+    # 每天 4 次（UTC 02:23 / 08:23 / 14:23 / 20:23），避开整点高峰以免排队延迟
+    - cron: '23 2,8,14,20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: AIPentest/CyberStrikeAI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---------- 1. 分支：同步默认分支 ----------
+      # 注意：本工作流自身提交在 main 上，因此 main 必然会与上游"分叉"。
+      # gh repo sync 只支持 fast-forward（分叉即报错），所以这里自己实现：
+      # 能快进就快进，否则用 merge commit 合并上游。
+      - name: Sync default branch
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
+          git fetch --force upstream "+refs/heads/main:refs/remotes/upstream/main"
+          if git merge --ff-only upstream/main; then
+            echo "main fast-forwarded to $(git rev-parse --short upstream/main)"
+          else
+            git merge --no-edit -m "chore: merge upstream main into main" upstream/main
+            echo "main merged with upstream (history diverged)"
+          fi
+          git push origin HEAD:main
+
+      # ---------- 2. Tags：上游 tag 全部同步过来 ----------
+      - name: Sync tags
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
+          git fetch upstream --tags --force
+          git push origin --tags
+          echo "tags synced"
+
+      # ---------- 3. Releases：补齐缺失的 release（含标题/描述/预发布标记） ----------
+      - name: Sync releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+
+          # 上游 tag -> commit sha
+          gh api --paginate --slurp "repos/${UPSTREAM}/tags?per_page=100" > "$work/tags.json"
+          jq -r 'add | .[] | [.name, .commit.sha] | @tsv' "$work/tags.json" > "$work/tags.tsv"
+          echo "upstream tags: $(wc -l < "$work/tags.tsv")"
+
+          # 本 fork 已有的 release
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$work/dst.json"
+          jq -r 'add // [] | .[] | .tag_name' "$work/dst.json" > "$work/existing.txt" || true
+          touch "$work/existing.txt"
+          echo "existing releases: $(wc -l < "$work/existing.txt")"
+
+          # 上游 release，按 created_at 升序，逐行 compact JSON（避免正文换行破坏读取）
+          gh api --paginate --slurp "repos/${UPSTREAM}/releases?per_page=100" > "$work/src.json"
+          jq -c 'add | sort_by(.created_at) | .[]' "$work/src.json" > "$work/src.ndjson"
+          echo "upstream releases: $(wc -l < "$work/src.ndjson")"
+
+          created=0
+          skipped=0
+          failed=0
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            tag=$(printf '%s' "$line" | jq -r '.tag_name')
+            if grep -qxF "$tag" "$work/existing.txt"; then
+              skipped=$((skipped + 1))
+              continue
+            fi
+            sha=$(awk -F'\t' -v t="$tag" '$1==t{print $2}' "$work/tags.tsv")
+            if [ -z "$sha" ]; then
+              echo "::warning::no commit sha for tag $tag, skipped"
+              failed=$((failed + 1))
+              continue
+            fi
+            printf '%s' "$line" | jq --arg sha "$sha" '{tag_name, target_commitish: $sha, name, body, draft, prerelease, make_latest: "true"}' > "$work/payload.json"
+            if gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" --input "$work/payload.json" > /dev/null 2>"$work/err.txt"; then
+              created=$((created + 1))
+              echo "created release $tag -> ${sha:0:8}"
+            elif grep -q 'already_exists' "$work/err.txt"; then
+              # 请求实际已成功、但响应异常导致重试时命中此分支，视为成功
+              created=$((created + 1))
+              echo "release $tag already present, treated as ok"
+            else
+              failed=$((failed + 1))
+              echo "::error::failed to create release $tag: $(cat "$work/err.txt")"
+            fi
+          done < "$work/src.ndjson"
+
+          # 校正 Latest 标记，使其与上游一致
+          # 注意：PATCH 用的是数字 release id，不存在 /releases/tags/{tag} 这个端点
+          latest=$(gh api "repos/${UPSTREAM}/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+          if [ -n "$latest" ]; then
+            rel_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${latest}" --jq '.id' 2>/dev/null || true)
+            if [ -n "$rel_id" ]; then
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${rel_id}" -f make_latest=true > /dev/null
+            else
+              echo "::warning::cannot resolve release id for latest tag ${latest}"
+            fi
+          fi
+
+          {
+            echo "## Upstream sync result"
+            echo ""
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| repository | ${GITHUB_REPOSITORY} |"
+            echo "| releases created | ${created} |"
+            echo "| releases already present | ${skipped} |"
+            echo "| failures | ${failed} |"
+            echo "| latest release | ${latest:-n/a} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "done: created=${created} skipped=${skipped} failed=${failed}"
+
+          if [ "$failed" -gt 0 ]; then
+            exit 1
+          fi
